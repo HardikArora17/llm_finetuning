@@ -4,6 +4,7 @@ from trl import SFTTrainer
 import pandas as pd
 from global_variables_llama3 import *
 import os
+import pathlib
 from itertools import chain
 from datasets import load_dataset
 import json
@@ -32,27 +33,29 @@ def run_finetuning(raw_dataset, model_name, new_model_name, output_path):
     
 
     def tokenize_function(examples):
-        return tokenizer(examples['text'], return_special_tokens_mask=True)
+        return tokenizer(examples['text'])
     
     tokenized_datasets = raw_dataset.map(
             tokenize_function,
             batched=True,
-            remove_columns=['text'],
+            num_proc=8,
             desc="Running tokenizer on every text in dataset",
         )
 
     processed_dataset = tokenized_datasets.map(
                 group_texts,
-                fn_kwargs={'max_seq_length': block_size},
+                fn_kwargs={'block_size': block_size},
                 batched=True,
+                num_proc =8,
                 desc=f"Grouping texts in chunks of {block_size}",
             )
     
     print("DATA_LOADED")
+    processed_dataset = processed_dataset.remove_columns("text")
     print(processed_dataset)
     
     
-    model = AutoModelForCausalLM.from_pretrained(model_name, device_map = 'auto', trust_remote_code =True, attn_implementation ='flash_attebntion_2')
+    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code =True, attn_implementation ='flash_attention_2', torch_dtype=torch.float16)
    
     print("MODEL INITIALIZED")
     print("Model's parameters device:", next(model.parameters()).device)
@@ -71,12 +74,14 @@ def run_finetuning(raw_dataset, model_name, new_model_name, output_path):
         logging_steps=logging_steps,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
+        save_total_limit=3,
         optim=optim,
         bf16=True,
         max_grad_norm=max_grad_norm,
         max_steps=max_steps,
         warmup_ratio=warmup_ratio,
         group_by_length=group_by_length,
+        deepspeed = 'ds_config_zero2.json',
         gradient_checkpointing = True,
         gradient_checkpointing_kwargs = {'use_reentrant':False},
         lr_scheduler_type=lr_scheduler_type)
@@ -84,29 +89,33 @@ def run_finetuning(raw_dataset, model_name, new_model_name, output_path):
     print("LOADED TRAINING ARGUMENTS")
     
     # Set supervised fine-tuning parameters
-    trainer = Trainer(
+    trainer = SFTTrainer(
                 model=model,
                 train_dataset=processed_dataset,
+                max_seq_length=512,
                 tokenizer=tokenizer,
+                dataset_text_field=None,
                 args=training_arguments)
               
-
-    trainer.train()
+    if list(pathlib.Path(training_arguments.output_dir).glob("checkpoint-*")):
+        print("====RESUMED_FROM_CHECKPOINT")
+        trainer.train(resume_from_checkpoint=True)
+    else:
+        print("=====STARTED_FROM_SCRATCH======")
+        trainer.train()
+    
     trainer.model.save_pretrained( f'{output_path}/{new_model_name}_pre')
     trainer.save_model(f'{output_path}/{new_model_name}')
-    
-    model_state_dict = model.state_dict()
-    torch.save(model_state_dict, f'{output_path}/{new_model_name}_state.pt')
 
     print("Model state dictionary saved.")
 
 
 if __name__ == '__main__':
     model_name = 'meta-llama/Meta-Llama-3-8B'
-    new_model_name = 'astrollama3-8B'
+    new_model_name = 'astrollama3-8B-chat_aic-our_code'
 
-    dataset_name = 'KnightHardik/temp-astro-full-text'
-    dataset = load_dataset(dataset_name)['train']
+    dataset_name = 'AstroMLab/arxiv-astro-abstract-intro-conclusion'
+    dataset = load_dataset(dataset_name)['split_train']
     
     output_file_path = 'stored_output_model_cpt'
     
